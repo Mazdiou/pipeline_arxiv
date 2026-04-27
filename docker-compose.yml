@@ -1,0 +1,166 @@
+# docker-compose.airflow.yml
+#
+# Stack Airflow pour l'ArXiv Pipeline.
+#
+# Usage :
+#   Première fois (build + init) :
+#     docker compose -f docker-compose.airflow.yml up airflow-init --build
+#     docker compose -f docker-compose.airflow.yml up -d
+#
+#   Démarrer :
+#     docker compose -f docker-compose.airflow.yml up -d
+#
+#   Arrêter :
+#     docker compose -f docker-compose.airflow.yml down
+#
+#   Voir les logs :
+#     docker compose -f docker-compose.airflow.yml logs -f airflow-scheduler
+#
+#   Reconstruire l'image après changement de requirements :
+#     docker compose -f docker-compose.airflow.yml build
+#
+# Interface Airflow : http://localhost:8080
+# Identifiants     : admin / admin  (modifiable via AIRFLOW_USERNAME / AIRFLOW_PASSWORD dans .env)
+
+# ── Configuration commune à tous les services Airflow ───────────────────────
+x-airflow-common: &airflow-common
+  image: arxiv-airflow:latest
+  build:
+    context: .
+    dockerfile: docker/airflow/Dockerfile
+  # Répertoire de travail = racine du projet → tous les chemins relatifs
+  # (data/dashboard.duckdb, data/pipeline_configs.json, models/, …) fonctionnent
+  working_dir: /opt/airflow/project
+  env_file:
+    - .env # charge STORAGE_BACKEND, HF_TOKEN, MINIO_*, AIRFLOW_*, etc.
+  environment:
+    &airflow-common-env # ── Airflow core ─────────────────────────────────────────────────────────
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/project/dags
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DEFAULT_TIMEZONE: UTC
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    AIRFLOW__WEBSERVER__SECRET_KEY: arxiv-pipeline-secret-key
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    # ── API REST ──────────────────────────────────────────────────────────────
+    # Active Basic Auth pour l'API REST (requis pour déclencher les DAGs depuis
+    # le dashboard via POST /api/v1/dags/{dag_id}/dagRuns)
+    AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth
+    # ── Python path ───────────────────────────────────────────────────────────
+    # Permet aux DAGs d'importer les modules du projet (collector, processor…)
+    PYTHONPATH: /opt/airflow/project
+    # ── MinIO ─────────────────────────────────────────────────────────────────
+    # Le service MinIO est dans le même réseau Docker — on utilise son nom de
+    # service comme hostname (fonctionne sur Linux/Azure et Docker Desktop).
+    MINIO_ENDPOINT: minio:9000
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  volumes:
+    # Projet complet monté en lecture/écriture :
+    # les DAGs lisent pipeline_configs.json et écrivent dans data/dashboard.duckdb
+    - .:/opt/airflow/project
+    # Logs Airflow séparés du projet
+    - airflow-logs:/opt/airflow/logs
+  depends_on: &airflow-common-depends-on
+    postgres:
+      condition: service_healthy
+    minio:
+      condition: service_healthy
+
+# ── Services ─────────────────────────────────────────────────────────────────
+services:
+  # ── Stockage objet MinIO ──────────────────────────────────────────────────
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000" # API S3
+      - "9001:9001" # Console web MinIO
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-password123}
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # ── Base de données metadata Airflow ──────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # ── Initialisation (run once) ──────────────────────────────────────────────
+  # Lance les migrations DB et crée l'utilisateur admin.
+  # S'arrête automatiquement après init — ne pas le relancer en boucle.
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        echo "=== Migrations Airflow ===" && \
+        airflow db migrate && \
+        echo "=== Création utilisateur admin ===" && \
+        airflow users create \
+          --username "${AIRFLOW_USERNAME:-admin}" \
+          --password "${AIRFLOW_PASSWORD:-admin}" \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@airflow.local 2>/dev/null || \
+        echo "(Utilisateur déjà existant — ignoré)" && \
+        echo "=== Init terminée ==="
+    environment:
+      <<: *airflow-common-env
+    restart: on-failure
+
+  # ── Interface web ─────────────────────────────────────────────────────────
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  # ── Planificateur ─────────────────────────────────────────────────────────
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - 'airflow jobs check --job-type SchedulerJob --hostname "$$(hostname)"'
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+# ── Volumes ──────────────────────────────────────────────────────────────────
+volumes:
+  minio-data: # Données MinIO (buckets raw, clean, gold, trends)
+  postgres-data: # Metadata Airflow (DAG runs, task states, variables…)
+  airflow-logs: # Logs des tâches Airflow

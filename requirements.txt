@@ -1,0 +1,21 @@
+# ArXiv Pipeline — Dépendances complètes
+#
+# Usage ciblé :
+#   pip install -r requirements/base.txt       # collector + MinIO uniquement
+#   pip install -r requirements/processor.txt  # + pandas/pyarrow/numpy
+#   pip install -r requirements/nlp.txt        # + NLP (enricher)
+#   pip install -r requirements/dw.txt         # + DuckDB
+#   pip install -r requirements/ui.txt         # + Streamlit
+#   pip install -r requirements/dev.txt        # + pytest
+#
+# Install complet :
+#   pip install -r requirements.txt
+#
+# Note : Airflow (dags/) requiert Linux/WSL2 — voir requirements/airflow.txt
+
+-r requirements/base.txt
+-r requirements/processor.txt
+-r requirements/nlp.txt
+-r requirements/dw.txt
+-r requirements/ui.txt
+-r requirements/dev.txt

@@ -1,0 +1,3 @@
+# Dépendances core — collecte arXiv et stockage MinIO
+arxiv==2.4.0
+minio==7.2.20

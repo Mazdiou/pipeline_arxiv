@@ -1,0 +1,11 @@
+# Dépendances Airflow
+#
+# Installation recommandée (Linux / WSL2) :
+#   pip install -r requirements/airflow.txt
+#
+# Variables d'environnement requises dans .env ou Airflow Variables :
+#   STORAGE_BACKEND, MINIO_ENDPOINT, MINIO_ACCESS_KEY, ...  (voir .env)
+#   DUCKDB_PATH  : chemin vers dashboard.duckdb (défaut : data/dashboard.duckdb)
+
+apache-airflow==2.9.3
+apache-airflow-providers-common-io

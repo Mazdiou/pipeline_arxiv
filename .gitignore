@@ -1,0 +1,4 @@
+data/
+logs/
+models/sentence_transformers/
+models/embeddings_cache/

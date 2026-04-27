@@ -1,0 +1,3 @@
+# Dépendances développement et tests
+pytest==9.0.2
+pytest-cov>=4.0.0

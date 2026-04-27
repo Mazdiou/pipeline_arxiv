@@ -1,0 +1,5 @@
+# Dépendances Phase 3 — Transformation RAW → CLEAN (processor/)
+-r base.txt
+pandas>=2.2.0
+pyarrow>=16.0.0
+numpy>=1.26.0,<2.0
