@@ -1,22 +1,8 @@
-"""
-dashboard/core/db.py
-
-Helpers de lecture DuckDB pour le dashboard.
-
-Toutes les requêtes passent par ce module — aucune autre page
-n'ouvre de connexion DuckDB directement.
-
-Conventions :
-    - Les connexions read-only sont la règle (lecture dashboard).
-    - Seule delete_category_all() utilise une connexion en écriture.
-    - Chaque fonction ferme sa connexion avant de retourner.
-    - Les erreurs sont loggées et retournent une valeur vide (jamais d'exception levée vers l'UI).
-"""
-
 from __future__ import annotations
 
 import logging
 import os
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -46,13 +32,13 @@ def db_exists() -> bool:
     return p.exists() and p.stat().st_size > 0
 
 
-def _connect(read_only: bool = True) -> duckdb.DuckDBPyConnection:
+def _connect(read_only: bool = True, retries: int = 3) -> duckdb.DuckDBPyConnection:
     """
-    Ouvre une connexion DuckDB.
+    Ouvre une connexion DuckDB avec retry (utile sur Azure VM avec I/O lents).
 
     Raises:
         FileNotFoundError : si dashboard.duckdb est absent.
-        duckdb.IOException : si le fichier est corrompu.
+        duckdb.IOException : si le fichier est corrompu après tous les retries.
     """
     path = _duckdb_path()
     if not Path(path).exists():
@@ -60,12 +46,16 @@ def _connect(read_only: bool = True) -> duckdb.DuckDBPyConnection:
             f"dashboard.duckdb introuvable : {path}. "
             "Lancez une première sync pour initialiser la base."
         )
-    return duckdb.connect(path, read_only=read_only)
+    last_exc: Exception = RuntimeError("connect failed")
+    for attempt in range(retries):
+        try:
+            return duckdb.connect(path, read_only=read_only)
+        except duckdb.IOException as exc:
+            last_exc = exc
+            if attempt < retries - 1:
+                time.sleep(0.5 * (attempt + 1))
+    raise last_exc
 
-
-# --------------------------------------------------------------------------- #
-# DataClasses                                                                  #
-# --------------------------------------------------------------------------- #
 
 @dataclass
 class CategoryRow:
@@ -82,20 +72,8 @@ class CategoryRow:
     n_topics: int
     n_months: int
 
-    # ------------------------------------------------------------------ #
-    # Badge d'état calculé                                                 #
-    # ------------------------------------------------------------------ #
-
     @property
     def status(self) -> str:
-        """
-        Retourne l'état de synchronisation de la catégorie.
-
-        Returns:
-            'ok'      : sync < 24h
-            'warning' : sync entre 24h et 7j
-            'error'   : sync > 7j ou jamais synchronisée
-        """
         if self.last_synced_at is None:
             return "error"
         now = datetime.now(tz=timezone.utc)
@@ -124,7 +102,6 @@ class CategoryRow:
 
     @property
     def last_synced_label(self) -> str:
-        """Retourne une représentation lisible de last_synced_at."""
         if self.last_synced_at is None:
             return "Jamais synchronisée"
         try:
@@ -159,27 +136,15 @@ class CategoryCounts:
 # Requêtes globales                                                            #
 # --------------------------------------------------------------------------- #
 
-def get_global_stats() -> dict:
-    """
-    KPI bar : statistiques agrégées sur toutes les catégories.
 
-    Returns:
-        dict avec les clés :
-            n_categories (int)
-            n_articles   (int)
-            last_sync    (datetime | None)
-    """
+def get_global_stats() -> dict:
     if not db_exists():
         return {"n_categories": 0, "n_articles": 0, "last_sync": None}
     conn = None
     try:
         conn = _connect()
-        n_cats = conn.execute(
-            "SELECT COUNT(*) FROM dim_categories"
-        ).fetchone()[0]
-        n_arts = conn.execute(
-            "SELECT COUNT(*) FROM fact_articles"
-        ).fetchone()[0]
+        n_cats = conn.execute("SELECT COUNT(*) FROM dim_categories").fetchone()[0]
+        n_arts = conn.execute("SELECT COUNT(*) FROM fact_articles").fetchone()[0]
         last_sync = conn.execute(
             "SELECT MAX(last_synced_at) FROM dim_categories"
         ).fetchone()[0]
@@ -192,22 +157,13 @@ def get_global_stats() -> dict:
 
 
 def get_all_category_rows() -> list[CategoryRow]:
-    """
-    Retourne dim_categories enrichi avec les statistiques par catégorie.
-
-    Joint fact_articles, dim_topics et fact_topic_monthly pour calculer
-    n_articles, n_topics et n_months sans requêtes supplémentaires.
-
-    Returns:
-        Liste de CategoryRow triée par category.
-        Liste vide si DuckDB absent ou erreur.
-    """
     if not db_exists():
         return []
     conn = None
     try:
         conn = _connect()
-        rows = conn.execute("""
+        rows = conn.execute(
+            """
             SELECT
                 c.category,
                 c.display_name,
@@ -233,7 +189,8 @@ def get_all_category_rows() -> list[CategoryRow]:
                 GROUP BY category
             ) m USING (category)
             ORDER BY c.category
-        """).fetchall()
+        """
+        ).fetchall()
         return [
             CategoryRow(
                 category=r[0],
@@ -257,17 +214,8 @@ def get_all_category_rows() -> list[CategoryRow]:
 # Requêtes par catégorie                                                       #
 # --------------------------------------------------------------------------- #
 
+
 def get_category_counts(category: str) -> CategoryCounts:
-    """
-    Retourne les compteurs détaillés d'une catégorie.
-    Utilisé pour peupler la modale de confirmation de suppression.
-
-    Args:
-        category : Identifiant interne (ex: 'stat_ML').
-
-    Returns:
-        CategoryCounts avec tous les compteurs à 0 en cas d'erreur.
-    """
     if not db_exists():
         return CategoryCounts()
     conn = None
@@ -303,14 +251,8 @@ def get_category_counts(category: str) -> CategoryCounts:
 # Page 1 — Vue catégorie                                                       #
 # --------------------------------------------------------------------------- #
 
-def get_categories_with_data() -> list[tuple[str, str]]:
-    """
-    Retourne les catégories qui ont des données dans DuckDB.
 
-    Returns:
-        Liste de tuples (category_id, display_name) triée par display_name.
-        Liste vide si DuckDB absent ou aucune catégorie.
-    """
+def get_categories_with_data() -> list[tuple[str, str]]:
     if not db_exists():
         return []
     conn = None
@@ -328,19 +270,6 @@ def get_categories_with_data() -> list[tuple[str, str]]:
 
 
 def get_category_overview(category: str) -> dict:
-    """
-    KPIs globaux d'une catégorie pour la barre de métriques.
-
-    Returns:
-        dict avec les clés :
-            n_articles   (int)
-            n_topics     (int)
-            n_months     (int)
-            avg_novelty  (float | None)
-            date_min     (str | None)  — premier mois publié (YYYY-MM)
-            date_max     (str | None)  — dernier mois publié (YYYY-MM)
-            pct_english  (float | None) — % articles en anglais
-    """
     if not db_exists():
         return {}
     conn = None
@@ -371,12 +300,12 @@ def get_category_overview(category: str) -> dict:
             [category],
         ).fetchone()[0]
         return {
-            "n_articles":  int(n_art),
-            "n_topics":    int(n_top),
-            "n_months":    int(n_mon),
+            "n_articles": int(n_art),
+            "n_topics": int(n_top),
+            "n_months": int(n_mon),
             "avg_novelty": round(float(avg_nov), 3) if avg_nov is not None else None,
-            "date_min":    dates[0],
-            "date_max":    dates[1],
+            "date_min": dates[0],
+            "date_max": dates[1],
             "pct_english": round(float(pct_en), 1) if pct_en is not None else None,
         }
     except Exception as exc:
@@ -387,12 +316,6 @@ def get_category_overview(category: str) -> dict:
 
 
 def get_monthly_volumes(category: str) -> list[dict]:
-    """
-    Volume d'articles par mois pour la catégorie.
-
-    Returns:
-        Liste de dicts {month, n_articles} triée par mois croissant.
-    """
     if not db_exists():
         return []
     conn = None
@@ -415,55 +338,78 @@ def get_monthly_volumes(category: str) -> list[dict]:
 
 
 def get_top_topics(category: str, limit: int = 20) -> list[dict]:
-    """
-    Top topics d'une catégorie triés par nombre d'articles.
-
-    Returns:
-        Liste de dicts :
-        {topic_id, topic_label, n_articles, n_months_active, last_status}
-    """
     if not db_exists():
         return []
     conn = None
     try:
         conn = _connect()
+
         rows = conn.execute(
-            """SELECT
-                   t.topic_id,
-                   t.topic_label,
-                   COALESCE(a.n_articles, 0) AS n_articles,
-                   t.n_months_active,
-                   tr.status AS last_status
-               FROM dim_topics t
-               LEFT JOIN (
-                   SELECT topic_id, COUNT(*) AS n_articles
-                   FROM fact_articles
-                   WHERE category = ?
-                   GROUP BY topic_id
-               ) a ON t.topic_id = a.topic_id
-               LEFT JOIN (
-                   SELECT topic_id, status
-                   FROM fact_trend_reports
-                   WHERE category = ?
-                     AND month = (
-                         SELECT MAX(month) FROM fact_trend_reports WHERE category = ?
-                     )
-               ) tr ON t.topic_id = tr.topic_id
-               WHERE t.category = ? AND t.topic_id >= 0
-               ORDER BY n_articles DESC
-               LIMIT ?""",
+            """
+            SELECT
+                t.topic_id,
+                
+                COALESCE(
+                    ANY_VALUE(a2.topic_label),
+                    t.topic_label,
+                    'Topic ' || t.topic_id
+                ) AS topic_label,
+
+                COALESCE(a.n_articles, 0) AS n_articles,
+                t.n_months_active,
+                tr.status AS last_status
+
+            FROM dim_topics t
+
+            LEFT JOIN (
+                SELECT topic_id, COUNT(*) AS n_articles
+                FROM fact_articles
+                WHERE category = ?
+                GROUP BY topic_id
+            ) a ON t.topic_id = a.topic_id
+
+            LEFT JOIN fact_articles a2
+                ON t.topic_id = a2.topic_id
+               AND t.category = a2.category
+
+            LEFT JOIN (
+                SELECT topic_id, status
+                FROM fact_trend_reports
+                WHERE category = ?
+                  AND month = (
+                      SELECT MAX(month)
+                      FROM fact_trend_reports
+                      WHERE category = ?
+                  )
+            ) tr ON t.topic_id = tr.topic_id
+
+            WHERE t.category = ?
+              AND t.topic_id >= 0
+
+            GROUP BY
+                t.topic_id,
+                t.n_months_active,
+                tr.status,
+                a.n_articles,
+                t.topic_label
+
+            ORDER BY n_articles DESC
+            LIMIT ?
+            """,
             [category, category, category, category, limit],
         ).fetchall()
+
         return [
             {
-                "topic_id":       int(r[0]),
-                "topic_label":    r[1],
-                "n_articles":     int(r[2]),
+                "topic_id": int(r[0]),
+                "topic_label": r[1] or f"Topic {r[0]}",
+                "n_articles": int(r[2]),
                 "n_months_active": int(r[3]),
-                "last_status":    r[4],
+                "last_status": r[4],
             }
             for r in rows
         ]
+
     except Exception as exc:
         logger.error("get_top_topics '%s' échoué : %s", category, exc)
         return []
@@ -472,12 +418,6 @@ def get_top_topics(category: str, limit: int = 20) -> list[dict]:
 
 
 def get_lang_distribution(category: str) -> list[dict]:
-    """
-    Distribution des langues pour une catégorie.
-
-    Returns:
-        Liste de dicts {lang, n_articles} triée par count décroissant.
-    """
     if not db_exists():
         return []
     conn = None
@@ -500,12 +440,6 @@ def get_lang_distribution(category: str) -> list[dict]:
 
 
 def get_status_counts(category: str) -> dict[str, int]:
-    """
-    Nombre de topics par état (EMERGING, TRENDING…) au dernier mois disponible.
-
-    Returns:
-        Dict {status: count}. Vide si aucun rapport de tendance.
-    """
     if not db_exists():
         return {}
     conn = None
@@ -534,6 +468,7 @@ def get_status_counts(category: str) -> dict[str, int]:
 # Page 4 — Articles                                                            #
 # --------------------------------------------------------------------------- #
 
+
 def get_articles_page(
     category: str,
     *,
@@ -548,26 +483,21 @@ def get_articles_page(
     limit: int = 25,
     offset: int = 0,
 ) -> list[dict]:
-    """
-    Retourne une page d'articles filtrés, triés par date décroissante.
-
-    Returns:
-        Liste de dicts :
-        {arxiv_id, title, first_author, published_date, updated,
-         primary_category, topic_label, lang, novelty_score,
-         intra_similarity, centroid_distance, is_topic_outlier,
-         citation_count, topic_prob, word_count, latex_density,
-         flesch_kincaid_grade, is_short_abstract, pdf_url,
-         keywords, entity_list}
-    """
     if not db_exists():
         return []
     conn = None
     try:
         conn = _connect()
         where, params = _articles_where(
-            category, topic_id, lang, month_from, month_to, novelty_min,
-            search, exclude_outliers, exclude_short,
+            category,
+            topic_id,
+            lang,
+            month_from,
+            month_to,
+            novelty_min,
+            search,
+            exclude_outliers,
+            exclude_short,
         )
         rows = conn.execute(
             f"""SELECT arxiv_id, title, first_author, authors_count,
@@ -575,7 +505,7 @@ def get_articles_page(
                        topic_label, lang,
                        novelty_score, intra_similarity, centroid_distance,
                        is_topic_outlier,
-                       citation_count, topic_prob, word_count, latex_density,
+                       citation_count, topic_prob, latex_density,
                        flesch_kincaid_grade, is_short_abstract,
                        pdf_url, keywords, entity_list
                 FROM fact_articles
@@ -586,28 +516,33 @@ def get_articles_page(
         ).fetchall()
         return [
             {
-                "arxiv_id":           r[0],
-                "title":              r[1] or "",
-                "first_author":       r[2] or "",
-                "authors_count":      int(r[3]) if r[3] is not None else None,
-                "published_date":     str(r[4]) if r[4] else "",
-                "updated":            str(r[5]) if r[5] else "",
-                "primary_category":   r[6] or "",
-                "topic_label":        r[7] or "",
-                "lang":               r[8] or "",
-                "novelty_score":      round(float(r[9]),  4) if r[9]  is not None else None,
-                "intra_similarity":   round(float(r[10]), 4) if r[10] is not None else None,
-                "centroid_distance":  round(float(r[11]), 4) if r[11] is not None else None,
-                "is_topic_outlier":   bool(r[12]) if r[12] is not None else False,
-                "citation_count":     int(r[13]) if r[13] is not None else None,
-                "topic_prob":         round(float(r[14]), 4) if r[14] is not None else None,
-                "word_count":         int(r[15]) if r[15] is not None else None,
-                "latex_density":      round(float(r[16]), 4) if r[16] is not None else None,
-                "flesch_kincaid_grade": round(float(r[17]), 2) if r[17] is not None else None,
-                "is_short_abstract":  bool(r[18]) if r[18] is not None else False,
-                "pdf_url":            r[19] or "",
-                "keywords":           r[20],
-                "entity_list":        r[21],
+                "arxiv_id": r[0],
+                "title": r[1] or "",
+                "first_author": r[2] or "",
+                "authors_count": int(r[3]) if r[3] is not None else None,
+                "published_date": str(r[4]) if r[4] else "",
+                "updated": str(r[5]) if r[5] else "",
+                "primary_category": r[6] or "",
+                "topic_label": r[7] or "",
+                "lang": r[8] or "",
+                "novelty_score": round(float(r[9]), 4) if r[9] is not None else None,
+                "intra_similarity": (
+                    round(float(r[10]), 4) if r[10] is not None else None
+                ),
+                "centroid_distance": (
+                    round(float(r[11]), 4) if r[11] is not None else None
+                ),
+                "is_topic_outlier": bool(r[12]) if r[12] is not None else False,
+                "citation_count": int(r[13]) if r[13] is not None else None,
+                "topic_prob": round(float(r[14]), 4) if r[14] is not None else None,
+                "latex_density": round(float(r[15]), 4) if r[15] is not None else None,
+                "flesch_kincaid_grade": (
+                    round(float(r[16]), 2) if r[16] is not None else None
+                ),
+                "is_short_abstract": bool(r[17]) if r[17] is not None else False,
+                "pdf_url": r[18] or "",
+                "keywords": r[19],
+                "entity_list": r[20],
             }
             for r in rows
         ]
@@ -630,15 +565,21 @@ def get_articles_count(
     exclude_outliers: bool = False,
     exclude_short: bool = False,
 ) -> int:
-    """Retourne le nombre total d'articles correspondant aux filtres."""
     if not db_exists():
         return 0
     conn = None
     try:
         conn = _connect()
         where, params = _articles_where(
-            category, topic_id, lang, month_from, month_to, novelty_min,
-            search, exclude_outliers, exclude_short,
+            category,
+            topic_id,
+            lang,
+            month_from,
+            month_to,
+            novelty_min,
+            search,
+            exclude_outliers,
+            exclude_short,
         )
         n = conn.execute(
             f"SELECT COUNT(*) FROM fact_articles WHERE {where}", params
@@ -653,11 +594,21 @@ def get_articles_count(
 
 def get_article_detail(arxiv_id: str, category: str) -> dict:
     """
-    Retourne le détail complet d'un article.
-
-    Returns:
-        Dict avec toutes les colonnes de fact_articles.
-        Dict vide si introuvable.
+    Mapping complet :
+        row[0]  arxiv_id            row[15] topic_label
+        row[1]  title               row[16] topic_prob
+        row[2]  abstract            row[17] is_topic_outlier
+        row[3]  first_author        row[18] primary_category
+        row[4]  authors_count       row[19] lang
+        row[5]  published_date      row[20] lang_confidence
+        row[6]  updated             row[21] novelty_score
+        row[7]  published_month     row[22] intra_similarity
+        row[8]  pdf_url             row[23] centroid_distance
+        row[10] journal_ref         row[25] latex_density
+        row[11] citation_count      row[26] flesch_kincaid_grade
+        row[12] reference_count     row[27] is_short_abstract
+        row[13] semantic_scholar_url row[28] keywords
+        row[14] topic_id            row[29] entity_list
     """
     if not db_exists():
         return {}
@@ -673,7 +624,7 @@ def get_article_detail(arxiv_id: str, category: str) -> dict:
                       primary_category,
                       lang, lang_confidence,
                       novelty_score, intra_similarity, centroid_distance,
-                      word_count, latex_density, flesch_kincaid_grade, is_short_abstract,
+                      latex_density, flesch_kincaid_grade, is_short_abstract,
                       keywords, entity_list
                FROM fact_articles
                WHERE arxiv_id = ? AND category = ?""",
@@ -682,39 +633,41 @@ def get_article_detail(arxiv_id: str, category: str) -> dict:
         if not row:
             return {}
 
-        def _f(v): return round(float(v), 4) if v is not None else None
+        def _f(v):
+            return round(float(v), 4) if v is not None else None
 
         return {
-            "arxiv_id":             row[0],
-            "title":                row[1] or "",
-            "abstract":             row[2] or "",
-            "first_author":         row[3] or "",
-            "authors_count":        int(row[4]) if row[4] is not None else None,
-            "published_date":       str(row[5]) if row[5] else "",
-            "updated":              str(row[6]) if row[6] else "",
-            "published_month":      row[7] or "",
-            "pdf_url":              row[8] or "",
-            "doi":                  row[9] or "",
-            "journal_ref":          row[10] or "",
-            "citation_count":       int(row[11]) if row[11] is not None else None,
-            "reference_count":      int(row[12]) if row[12] is not None else None,
+            "arxiv_id": row[0],
+            "title": row[1] or "",
+            "abstract": row[2] or "",
+            "first_author": row[3] or "",
+            "authors_count": int(row[4]) if row[4] is not None else None,
+            "published_date": str(row[5]) if row[5] else "",
+            "updated": str(row[6]) if row[6] else "",
+            "published_month": row[7] or "",
+            "pdf_url": row[8] or "",
+            "doi": row[9] or "",
+            "journal_ref": row[10] or "",
+            "citation_count": int(row[11]) if row[11] is not None else None,
+            "reference_count": int(row[12]) if row[12] is not None else None,
             "semantic_scholar_url": row[13] or "",
-            "topic_id":             row[14],
-            "topic_label":          row[15] or "",
-            "topic_prob":           _f(row[16]),
-            "is_topic_outlier":     bool(row[17]) if row[17] is not None else False,
-            "primary_category":     row[18] or "",
-            "lang":                 row[19] or "",
-            "lang_confidence":      _f(row[20]),
-            "novelty_score":        _f(row[21]),
-            "intra_similarity":     _f(row[22]),
-            "centroid_distance":    _f(row[23]),
-            "word_count":           int(row[24]) if row[24] is not None else None,
-            "latex_density":        _f(row[25]),
-            "flesch_kincaid_grade": round(float(row[26]), 2) if row[26] is not None else None,
-            "is_short_abstract":    bool(row[27]) if row[27] is not None else False,
-            "keywords":             row[28],
-            "entity_list":          row[29],
+            "topic_id": row[14],
+            "topic_label": row[15] or "",
+            "topic_prob": _f(row[16]),
+            "is_topic_outlier": bool(row[17]) if row[17] is not None else False,
+            "primary_category": row[18] or "",
+            "lang": row[19] or "",
+            "lang_confidence": _f(row[20]),
+            "novelty_score": _f(row[21]),
+            "intra_similarity": _f(row[22]),
+            "centroid_distance": _f(row[23]),
+            "latex_density": _f(row[24]),
+            "flesch_kincaid_grade": (
+                round(float(row[25]), 2) if row[25] is not None else None
+            ),
+            "is_short_abstract": bool(row[26]) if row[26] is not None else False,
+            "keywords": row[27],
+            "entity_list": row[28],
         }
     except Exception as exc:
         logger.error("get_article_detail '%s' échoué : %s", arxiv_id, exc)
@@ -724,7 +677,6 @@ def get_article_detail(arxiv_id: str, category: str) -> dict:
 
 
 def get_distinct_langs(category: str) -> list[str]:
-    """Retourne les langues distinctes présentes dans la catégorie."""
     if not db_exists():
         return []
     conn = None
@@ -756,7 +708,6 @@ def _articles_where(
     exclude_outliers: bool = False,
     exclude_short: bool = False,
 ) -> tuple[str, list]:
-    """Construit la clause WHERE et la liste de paramètres pour les requêtes articles."""
     clauses = ["category = ?"]
     params: list = [category]
 
@@ -790,15 +741,8 @@ def _articles_where(
 # Page 3 — Analyse d'un topic                                                  #
 # --------------------------------------------------------------------------- #
 
-def get_topics_for_category(category: str) -> list[dict]:
-    """
-    Liste des topics d'une catégorie pour le sélecteur de la Page 3.
 
-    Returns:
-        Liste de dicts {topic_id, topic_label, n_months_active,
-                        status, composite_score, n_articles}
-        triée par composite_score décroissant (None en dernier).
-    """
+def get_topics_for_category(category: str) -> list[dict]:
     if not db_exists():
         return []
     conn = None
@@ -807,7 +751,15 @@ def get_topics_for_category(category: str) -> list[dict]:
         rows = conn.execute(
             """SELECT
                    t.topic_id,
-                   t.topic_label,
+                   COALESCE(
+                       (SELECT topic_label
+                        FROM fact_articles
+                        WHERE category = t.category AND topic_id = t.topic_id
+                          AND topic_label IS NOT NULL
+                        LIMIT 1),
+                       t.topic_label,
+                       'Topic ' || t.topic_id
+                   ) AS topic_label,
                    t.n_months_active,
                    tr.status,
                    tr.composite_score,
@@ -816,7 +768,8 @@ def get_topics_for_category(category: str) -> list[dict]:
                LEFT JOIN fact_trend_reports tr
                    ON t.topic_id = tr.topic_id AND t.category = tr.category
                    AND tr.month = (
-                       SELECT MAX(month) FROM fact_trend_reports WHERE category = ?
+                       SELECT MAX(month) FROM fact_trend_reports
+                       WHERE category = ? AND topic_id = t.topic_id
                    )
                LEFT JOIN (
                    SELECT topic_id, COUNT(*) AS n_articles
@@ -829,12 +782,12 @@ def get_topics_for_category(category: str) -> list[dict]:
         ).fetchall()
         return [
             {
-                "topic_id":        int(r[0]),
-                "topic_label":     r[1] or f"Topic {r[0]}",
+                "topic_id": int(r[0]),
+                "topic_label": r[1] or f"Topic {r[0]}",
                 "n_months_active": int(r[2]),
-                "status":          r[3],
+                "status": r[3],
                 "composite_score": round(float(r[4]), 4) if r[4] is not None else None,
-                "n_articles":      int(r[5]),
+                "n_articles": int(r[5]),
             }
             for r in rows
         ]
@@ -847,12 +800,11 @@ def get_topics_for_category(category: str) -> list[dict]:
 
 def get_topic_detail(category: str, topic_id: int) -> dict:
     """
-    Rapport complet du dernier mois pour un topic donné.
-
-    Returns:
-        Dict avec toutes les colonnes de fact_trend_reports + métadonnées
-        dim_topics (first_month, last_month) + n_articles total.
-        Dict vide si introuvable.
+    CORRECTIONS :
+        - JOIN → LEFT JOIN sur fact_trend_reports
+        - MAX(month) filtré sur topic_id (pas global catégorie)
+        - 6 paramètres au lieu de 5
+        - topic_label amélioré avec fallback depuis fact_articles
     """
     if not db_exists():
         return {}
@@ -861,13 +813,20 @@ def get_topic_detail(category: str, topic_id: int) -> dict:
         conn = _connect()
         row = conn.execute(
             """SELECT
-                   t.topic_label,
+                   COALESCE(
+                       (SELECT topic_label
+                        FROM fact_articles
+                        WHERE category = t.category AND topic_id = t.topic_id
+                          AND topic_label IS NOT NULL
+                        LIMIT 1),
+                       t.topic_label,
+                       'Topic ' || t.topic_id
+                   ) AS topic_label,
                    t.first_month,
                    t.last_month,
                    t.n_months_active,
                    tr.month,
                    tr.status,
-                   -- scores principaux
                    tr.composite_score,
                    tr.trend_score,
                    tr.weak_signal_score,
@@ -885,7 +844,6 @@ def get_topic_detail(category: str, topic_id: int) -> dict:
                    tr.semantic_drift_last,
                    tr.keyword_drift_last,
                    tr.stability_score,
-                   -- features enricher
                    tr.mean_novelty,
                    tr.mean_topic_prob,
                    tr.mean_centroid_distance,
@@ -895,17 +853,18 @@ def get_topic_detail(category: str, topic_id: int) -> dict:
                    tr.pct_cross_category,
                    COALESCE(a.n_articles, 0) AS n_articles
                FROM dim_topics t
-               JOIN fact_trend_reports tr
+               LEFT JOIN fact_trend_reports tr
                    ON t.topic_id = tr.topic_id AND t.category = tr.category
                    AND tr.month = (
-                       SELECT MAX(month) FROM fact_trend_reports WHERE category = ?
+                       SELECT MAX(month) FROM fact_trend_reports
+                       WHERE category = ? AND topic_id = ?
                    )
                LEFT JOIN (
                    SELECT COUNT(*) AS n_articles
                    FROM fact_articles WHERE category = ? AND topic_id = ?
                ) a ON TRUE
                WHERE t.topic_id = ? AND t.category = ?""",
-            [category, category, topic_id, topic_id, category],
+            [category, topic_id, category, topic_id, topic_id, category],
         ).fetchone()
         if not row:
             return {}
@@ -914,38 +873,41 @@ def get_topic_detail(category: str, topic_id: int) -> dict:
             return round(float(v), 4) if v is not None else None
 
         return {
-            "topic_label":                     row[0] or f"Topic {topic_id}",
-            "first_month":                     row[1],
-            "last_month":                      row[2],
-            "n_months_active":                 int(row[3]),
-            "report_month":                    row[4],
-            "status":                          row[5],
-            "composite_score":                 _f(row[6]),
-            "trend_score":                     _f(row[7]),
-            "weak_signal_score":               _f(row[8]),
-            "semantic_score":                  _f(row[9]),
-            "z_score_last":                    _f(row[10]),
-            "ols_slope":                       _f(row[11]),
-            "mann_kendall_tau":                _f(row[12]),
-            "mann_kendall_pvalue":             _f(row[13]),
-            "hurst_exponent":                  _f(row[14]),
-            "cagr":                            _f(row[15]),
-            "burst_state_last":                int(row[16]) if row[16] is not None else None,
-            "emergence_score_last":            _f(row[17]),
+            "topic_label": row[0] or f"Topic {topic_id}",
+            "first_month": row[1],
+            "last_month": row[2],
+            "n_months_active": int(row[3]),
+            "report_month": row[4],
+            "status": row[5],
+            "composite_score": _f(row[6]),
+            "trend_score": _f(row[7]),
+            "weak_signal_score": _f(row[8]),
+            "semantic_score": _f(row[9]),
+            "z_score_last": _f(row[10]),
+            "ols_slope": _f(row[11]),
+            "mann_kendall_tau": _f(row[12]),
+            "mann_kendall_pvalue": _f(row[13]),
+            "hurst_exponent": _f(row[14]),
+            "cagr": _f(row[15]),
+            "burst_state_last": int(row[16]) if row[16] is not None else None,
+            "emergence_score_last": _f(row[17]),
             "novelty_weighted_emergence_last": _f(row[18]),
-            "persistence_score":               _f(row[19]),
-            "semantic_drift_last":             _f(row[20]),
-            "keyword_drift_last":              _f(row[21]),
-            "stability_score":                 _f(row[22]),
-            # Features enricher
-            "mean_novelty":                    _f(row[23]),
-            "mean_topic_prob":                 _f(row[24]),
-            "mean_centroid_distance":          _f(row[25]),
-            "pct_english":                     round(float(row[26]), 1) if row[26] is not None else None,
-            "mean_flesch_grade":               round(float(row[27]), 2) if row[27] is not None else None,
-            "mean_latex_density":              _f(row[28]),
-            "pct_cross_category":              round(float(row[29]), 1) if row[29] is not None else None,
-            "n_articles":                      int(row[30]),
+            "persistence_score": _f(row[19]),
+            "semantic_drift_last": _f(row[20]),
+            "keyword_drift_last": _f(row[21]),
+            "stability_score": _f(row[22]),
+            "mean_novelty": _f(row[23]),
+            "mean_topic_prob": _f(row[24]),
+            "mean_centroid_distance": _f(row[25]),
+            "pct_english": round(float(row[26]), 1) if row[26] is not None else None,
+            "mean_flesch_grade": (
+                round(float(row[27]), 2) if row[27] is not None else None
+            ),
+            "mean_latex_density": _f(row[28]),
+            "pct_cross_category": (
+                round(float(row[29]), 1) if row[29] is not None else None
+            ),
+            "n_articles": int(row[30]),
         }
     except Exception as exc:
         logger.error("get_topic_detail '%s'/%s échoué : %s", category, topic_id, exc)
@@ -955,13 +917,6 @@ def get_topic_detail(category: str, topic_id: int) -> dict:
 
 
 def get_topic_monthly_stats(category: str, topic_id: int) -> list[dict]:
-    """
-    Historique mensuel d'un topic depuis fact_topic_monthly.
-
-    Returns:
-        Liste de dicts {month, n_articles, pct_articles, mean_novelty, top_keywords}
-        triée par mois croissant.
-    """
     if not db_exists():
         return []
     conn = None
@@ -979,36 +934,39 @@ def get_topic_monthly_stats(category: str, topic_id: int) -> list[dict]:
         ).fetchall()
         return [
             {
-                "month":                 r[0],
-                "n_articles":            int(r[1]),
-                "pct_articles":          round(float(r[2]),  2) if r[2]  is not None else None,
-                "mean_novelty":          round(float(r[3]),  4) if r[3]  is not None else None,
-                "mean_topic_prob":       round(float(r[4]),  4) if r[4]  is not None else None,
-                "pct_english":           round(float(r[5]),  1) if r[5]  is not None else None,
-                "mean_centroid_distance":round(float(r[6]),  4) if r[6]  is not None else None,
-                "dominant_lang":         r[7] or "",
-                "mean_flesch_grade":     round(float(r[8]),  2) if r[8]  is not None else None,
-                "mean_latex_density":    round(float(r[9]),  4) if r[9]  is not None else None,
-                "pct_cross_category":    round(float(r[10]), 1) if r[10] is not None else None,
-                "top_keywords":          r[11],
+                "month": r[0],
+                "n_articles": int(r[1]),
+                "pct_articles": round(float(r[2]), 2) if r[2] is not None else None,
+                "mean_novelty": round(float(r[3]), 4) if r[3] is not None else None,
+                "mean_topic_prob": round(float(r[4]), 4) if r[4] is not None else None,
+                "pct_english": round(float(r[5]), 1) if r[5] is not None else None,
+                "mean_centroid_distance": (
+                    round(float(r[6]), 4) if r[6] is not None else None
+                ),
+                "dominant_lang": r[7] or "",
+                "mean_flesch_grade": (
+                    round(float(r[8]), 2) if r[8] is not None else None
+                ),
+                "mean_latex_density": (
+                    round(float(r[9]), 4) if r[9] is not None else None
+                ),
+                "pct_cross_category": (
+                    round(float(r[10]), 1) if r[10] is not None else None
+                ),
+                "top_keywords": r[11],
             }
             for r in rows
         ]
     except Exception as exc:
-        logger.error("get_topic_monthly_stats '%s'/%s échoué : %s", category, topic_id, exc)
+        logger.error(
+            "get_topic_monthly_stats '%s'/%s échoué : %s", category, topic_id, exc
+        )
         return []
     finally:
         _close(conn)
 
 
 def get_trend_full_history(category: str, topic_id: int) -> list[dict]:
-    """
-    Historique mensuel complet des scores d'un topic (toutes les métriques).
-
-    Returns:
-        Liste de dicts avec toutes les colonnes de fact_trend_reports,
-        triée par mois croissant.
-    """
     if not db_exists():
         return []
     conn = None
@@ -1031,25 +989,27 @@ def get_trend_full_history(category: str, topic_id: int) -> list[dict]:
 
         return [
             {
-                "month":                  r[0],
-                "status":                 r[1],
-                "composite_score":        _f(r[2]),
-                "trend_score":            _f(r[3]),
-                "weak_signal_score":      _f(r[4]),
-                "semantic_score":         _f(r[5]),
-                "z_score_last":           _f(r[6]),
-                "ols_slope":              _f(r[7]),
-                "cagr":                   _f(r[8]),
-                "emergence_score_last":   _f(r[9]),
-                "persistence_score":      _f(r[10]),
-                "semantic_drift_last":    _f(r[11]),
-                "keyword_drift_last":     _f(r[12]),
-                "stability_score":        _f(r[13]),
+                "month": r[0],
+                "status": r[1],
+                "composite_score": _f(r[2]),
+                "trend_score": _f(r[3]),
+                "weak_signal_score": _f(r[4]),
+                "semantic_score": _f(r[5]),
+                "z_score_last": _f(r[6]),
+                "ols_slope": _f(r[7]),
+                "cagr": _f(r[8]),
+                "emergence_score_last": _f(r[9]),
+                "persistence_score": _f(r[10]),
+                "semantic_drift_last": _f(r[11]),
+                "keyword_drift_last": _f(r[12]),
+                "stability_score": _f(r[13]),
             }
             for r in rows
         ]
     except Exception as exc:
-        logger.error("get_trend_full_history '%s'/%s échoué : %s", category, topic_id, exc)
+        logger.error(
+            "get_trend_full_history '%s'/%s échoué : %s", category, topic_id, exc
+        )
         return []
     finally:
         _close(conn)
@@ -1059,19 +1019,10 @@ def get_trend_full_history(category: str, topic_id: int) -> list[dict]:
 # Page 2 — Radar des tendances                                                 #
 # --------------------------------------------------------------------------- #
 
-def get_trends_overview(category: str) -> list[dict]:
-    """
-    Retourne tous les topics avec leur dernier rapport de tendance.
 
-    Returns:
-        Liste de dicts :
-        {topic_id, topic_label, n_months_active,
-         status, composite_score, trend_score, weak_signal_score,
-         semantic_score, z_score_last, ols_slope, cagr,
-         emergence_score_last, persistence_score,
-         semantic_drift_last, keyword_drift_last,
-         n_articles}
-        Triée par composite_score décroissant (None en dernier).
+def get_available_trend_months(category: str) -> list[str]:
+    """
+    AJOUT : retourne les mois disponibles pour le sélecteur de la Page 2.
     """
     if not db_exists():
         return []
@@ -1079,7 +1030,100 @@ def get_trends_overview(category: str) -> list[dict]:
     try:
         conn = _connect()
         rows = conn.execute(
+            """SELECT DISTINCT month
+               FROM fact_trend_reports
+               WHERE category = ?
+               ORDER BY month DESC""",
+            [category],
+        ).fetchall()
+        return [r[0] for r in rows]
+    except Exception as exc:
+        logger.error("get_available_trend_months '%s' échoué : %s", category, exc)
+        return []
+    finally:
+        _close(conn)
+
+
+def get_trends_overview(category: str, month: Optional[str] = None) -> list[dict]:
+    """
+    CORRIGÉ :
+        - label topic enrichi depuis fact_articles (fallback intelligent)
+        - LEFT JOIN conservé
+        - month inchangé
+    """
+    if not db_exists():
+        return []
+    conn = None
+    try:
+        conn = _connect()
+
+        # Résoudre le mois cible
+        if month is not None:
+            target_month = month
+        else:
+            result = conn.execute(
+                "SELECT MAX(month) FROM fact_trend_reports WHERE category = ?",
+                [category],
+            ).fetchone()
+            target_month = result[0] if result and result[0] else None
+
+        if target_month is None:
+            return []
+
+        rows = conn.execute(
             """SELECT
+                   t.topic_id,
+
+                   COALESCE(
+                       ANY_VALUE(a2.topic_label),
+                       t.topic_label,
+                       'Topic ' || t.topic_id
+                   ) AS topic_label,
+
+                   t.n_months_active,
+                   tr.status,
+                   tr.composite_score,
+                   tr.trend_score,
+                   tr.weak_signal_score,
+                   tr.semantic_score,
+                   tr.z_score_last,
+                   tr.ols_slope,
+                   tr.cagr,
+                   tr.emergence_score_last,
+                   tr.persistence_score,
+                   tr.semantic_drift_last,
+                   tr.keyword_drift_last,
+                   tr.mean_novelty,
+                   tr.mean_topic_prob,
+                   tr.mean_centroid_distance,
+                   tr.pct_english,
+                   tr.mean_flesch_grade,
+                   tr.mean_latex_density,
+                   tr.pct_cross_category,
+                   COALESCE(a.n_articles, 0) AS n_articles
+
+               FROM dim_topics t
+
+               LEFT JOIN fact_trend_reports tr
+                   ON t.topic_id = tr.topic_id
+                  AND t.category = tr.category
+                  AND tr.month = ?
+
+               LEFT JOIN (
+                   SELECT topic_id, COUNT(*) AS n_articles
+                   FROM fact_articles
+                   WHERE category = ?
+                   GROUP BY topic_id
+               ) a ON t.topic_id = a.topic_id
+
+               LEFT JOIN fact_articles a2
+                   ON t.topic_id = a2.topic_id
+                  AND t.category = a2.category
+
+               WHERE t.category = ?
+                 AND t.topic_id >= 0
+
+               GROUP BY
                    t.topic_id,
                    t.topic_label,
                    t.n_months_active,
@@ -1095,7 +1139,6 @@ def get_trends_overview(category: str) -> list[dict]:
                    tr.persistence_score,
                    tr.semantic_drift_last,
                    tr.keyword_drift_last,
-                   -- features enricher
                    tr.mean_novelty,
                    tr.mean_topic_prob,
                    tr.mean_centroid_distance,
@@ -1103,21 +1146,11 @@ def get_trends_overview(category: str) -> list[dict]:
                    tr.mean_flesch_grade,
                    tr.mean_latex_density,
                    tr.pct_cross_category,
-                   COALESCE(a.n_articles, 0) AS n_articles
-               FROM dim_topics t
-               JOIN fact_trend_reports tr
-                   ON t.topic_id = tr.topic_id AND t.category = tr.category
-                   AND tr.month = (
-                       SELECT MAX(month) FROM fact_trend_reports WHERE category = ?
-                   )
-               LEFT JOIN (
-                   SELECT topic_id, COUNT(*) AS n_articles
-                   FROM fact_articles WHERE category = ?
-                   GROUP BY topic_id
-               ) a ON t.topic_id = a.topic_id
-               WHERE t.category = ? AND t.topic_id >= 0
-               ORDER BY COALESCE(tr.composite_score, -999) DESC""",
-            [category, category, category],
+                   a.n_articles
+
+               ORDER BY COALESCE(tr.composite_score, -999) DESC
+            """,
+            [target_month, category, category],
         ).fetchall()
 
         def _f(v):
@@ -1125,32 +1158,37 @@ def get_trends_overview(category: str) -> list[dict]:
 
         return [
             {
-                "topic_id":               int(r[0]),
-                "topic_label":            r[1] or f"Topic {r[0]}",
-                "n_months_active":        int(r[2]),
-                "status":                 r[3],
-                "composite_score":        _f(r[4]),
-                "trend_score":            _f(r[5]),
-                "weak_signal_score":      _f(r[6]),
-                "semantic_score":         _f(r[7]),
-                "z_score_last":           _f(r[8]),
-                "ols_slope":              _f(r[9]),
-                "cagr":                   _f(r[10]),
-                "emergence_score_last":   _f(r[11]),
-                "persistence_score":      _f(r[12]),
-                "semantic_drift_last":    _f(r[13]),
-                "keyword_drift_last":     _f(r[14]),
-                "mean_novelty":           _f(r[15]),
-                "mean_topic_prob":         _f(r[16]),
-                "mean_centroid_distance":  _f(r[17]),
-                "pct_english":             round(float(r[18]), 1) if r[18] is not None else None,
-                "mean_flesch_grade":       round(float(r[19]), 2) if r[19] is not None else None,
-                "mean_latex_density":      _f(r[20]),
-                "pct_cross_category":      round(float(r[21]), 1) if r[21] is not None else None,
-                "n_articles":              int(r[22]),
+                "topic_id": int(r[0]),
+                "topic_label": r[1] or f"Topic {r[0]}",
+                "n_months_active": int(r[2]),
+                "status": r[3],
+                "composite_score": _f(r[4]),
+                "trend_score": _f(r[5]),
+                "weak_signal_score": _f(r[6]),
+                "semantic_score": _f(r[7]),
+                "z_score_last": _f(r[8]),
+                "ols_slope": _f(r[9]),
+                "cagr": _f(r[10]),
+                "emergence_score_last": _f(r[11]),
+                "persistence_score": _f(r[12]),
+                "semantic_drift_last": _f(r[13]),
+                "keyword_drift_last": _f(r[14]),
+                "mean_novelty": _f(r[15]),
+                "mean_topic_prob": _f(r[16]),
+                "mean_centroid_distance": _f(r[17]),
+                "pct_english": round(float(r[18]), 1) if r[18] is not None else None,
+                "mean_flesch_grade": (
+                    round(float(r[19]), 2) if r[19] is not None else None
+                ),
+                "mean_latex_density": _f(r[20]),
+                "pct_cross_category": (
+                    round(float(r[21]), 1) if r[21] is not None else None
+                ),
+                "n_articles": int(r[22]),
             }
             for r in rows
         ]
+
     except Exception as exc:
         logger.error("get_trends_overview '%s' échoué : %s", category, exc)
         return []
@@ -1159,13 +1197,6 @@ def get_trends_overview(category: str) -> list[dict]:
 
 
 def get_trend_history(category: str, topic_id: int) -> list[dict]:
-    """
-    Historique mensuel des scores d'un topic.
-
-    Returns:
-        Liste de dicts {month, composite_score, trend_score, status}
-        triée par mois croissant.
-    """
     if not db_exists():
         return []
     conn = None
@@ -1180,10 +1211,10 @@ def get_trend_history(category: str, topic_id: int) -> list[dict]:
         ).fetchall()
         return [
             {
-                "month":           r[0],
+                "month": r[0],
                 "composite_score": round(float(r[1]), 4) if r[1] is not None else None,
-                "trend_score":     round(float(r[2]), 4) if r[2] is not None else None,
-                "status":          r[3],
+                "trend_score": round(float(r[2]), 4) if r[2] is not None else None,
+                "status": r[3],
             }
             for r in rows
         ]
@@ -1198,22 +1229,8 @@ def get_trend_history(category: str, topic_id: int) -> list[dict]:
 # Suppression                                                                  #
 # --------------------------------------------------------------------------- #
 
+
 def delete_category_all(category: str) -> tuple[bool, str]:
-    """
-    Supprime toutes les données d'une catégorie dans DuckDB.
-
-    Ordre de suppression :
-        1. delete_category() — 4 tables fact/dim (depuis duckdb_sync/schema.py)
-        2. DELETE FROM dim_categories
-
-    La suppression de pipeline_configs.json est à la charge de l'appelant.
-
-    Args:
-        category : Identifiant interne (ex: 'stat_ML').
-
-    Returns:
-        Tuple (success: bool, message: str).
-    """
     if not db_exists():
         return False, "dashboard.duckdb introuvable."
     conn = None
@@ -1223,9 +1240,7 @@ def delete_category_all(category: str) -> tuple[bool, str]:
         conn = _connect(read_only=False)
         conn.execute("BEGIN")
         delete_category(conn, category)
-        conn.execute(
-            "DELETE FROM dim_categories WHERE category = ?", [category]
-        )
+        conn.execute("DELETE FROM dim_categories WHERE category = ?", [category])
         conn.execute("COMMIT")
         conn.close()
         return True, f"Catégorie '{category}' supprimée de DuckDB."

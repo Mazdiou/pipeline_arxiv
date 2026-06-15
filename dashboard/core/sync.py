@@ -58,7 +58,7 @@ def run_sync(category: str, display_name: str) -> SyncResult:
         SyncResult avec les compteurs post-sync ou l'erreur.
     """
     duckdb_path = os.getenv("DUCKDB_PATH", "data/dashboard.duckdb")
-    backend     = os.getenv("STORAGE_BACKEND", "local").lower()
+    backend = os.getenv("STORAGE_BACKEND", "local").lower()
 
     try:
         from duckdb_sync import DuckDBSync
@@ -88,6 +88,7 @@ def run_sync(category: str, display_name: str) -> SyncResult:
 
         # Récupérer les compteurs post-sync
         from dashboard.core.db import get_category_counts
+
         counts = get_category_counts(category)
         return SyncResult(
             category=category,

@@ -45,7 +45,7 @@ def render_category_selector(categories: list[tuple[str, str]]) -> Optional[str]
         return None
 
     options = [cat_id for cat_id, _ in categories]
-    labels  = {cat_id: display for cat_id, display in categories}
+    labels = {cat_id: display for cat_id, display in categories}
 
     # Initialise ou corrige la valeur en session (catégorie supprimée entre deux sessions)
     current = st.session_state.get("selected_category")

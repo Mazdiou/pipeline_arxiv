@@ -1,17 +1,15 @@
 """
-dashboard/app.py
-
 Point d'entrée du dashboard ArXiv Pipeline.
 
 Usage :
     streamlit run dashboard/app.py
 
 Navigation :
-    Page 0 — Contrôle      : gestion des catégories, triggers Airflow, statut live
-    Page 1 — Vue catégorie  : KPIs, volume mensuel, top topics, états
-    Page 2 — Tendances      : radar par état, cards de scores, tableau comparatif
-    Page 3 — Topic          : évolution, 13 métriques, dérives sémantique/lexicale
-    Page 4 — Articles       : table filtrée paginée, détail avec NER et mots-clés
+    Page 0 : Contrôle      : gestion des catégories, triggers Airflow, statut live
+    Page 1 : Vue catégorie  : KPIs, volume mensuel, top topics, états
+    Page 2 : Tendances      : radar par état, cards de scores, tableau comparatif
+    Page 3 : Topic          : évolution, 13 métriques, dérives sémantique/lexicale
+    Page 4 : Articles       : table filtrée paginée, détail avec NER et mots-clés
 """
 
 import sys
@@ -26,9 +24,10 @@ if _PROJECT_ROOT not in sys.path:
 # Charge .env depuis la racine du projet (STORAGE_BACKEND, MINIO_*, etc.)
 try:
     from dotenv import load_dotenv
+
     load_dotenv(os.path.join(_PROJECT_ROOT, ".env"))
 except ImportError:
-    pass  # python-dotenv absent → variables déjà injectées dans l'environnement
+    pass  # python-dotenv absent : variables déjà injectées dans l'environnement
 
 import streamlit as st
 from dashboard.views import (
@@ -39,7 +38,7 @@ from dashboard.views import (
     page_articles,
 )
 
-# ── Configuration globale Streamlit ─────────────────────────────────────────
+# Configuration globale Streamlit
 st.set_page_config(
     page_title="ArXiv Pipeline",
     page_icon="🔬",
@@ -47,27 +46,33 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── Navigation ───────────────────────────────────────────────────────────────
+# Navigation
 PAGES = {
-    "⚙️  Contrôle":         page_control,
-    "📊  Vue catégorie":     page_category,
-    "📈  Tendances":         page_trends,
-    "🔍  Analyse topic":     page_topic,
-    "📄  Articles":          page_articles,
+    "⚙️  Contrôle": page_control,
+    "📊  Vue catégorie": page_category,
+    "📈  Tendances": page_trends,
+    "🔍  Analyse topic": page_topic,
+    "📄  Articles": page_articles,
 }
 
+# Résoudre la navigation différée avant tout widget (radio inclus).
+# pop() garantit qu'elle n'est lue qu'une seule fois : évite les redirections en boucle.
+_pending = st.session_state.pop("_pending_nav", None)
+if _pending and "page" in _pending:
+    st.session_state["nav_selection"] = _pending["page"]
+
 with st.sidebar:
-    st.markdown("## 🔬 ArXiv Pipeline")
+    st.markdown("## ArXiv Pipeline")
     st.divider()
     selection = st.radio(
         "Navigation",
         options=list(PAGES.keys()),
+        key="nav_selection",
         label_visibility="collapsed",
     )
     st.divider()
-    st.caption("v0.1 · dashboard.duckdb")
 
-# ── Rendu de la page sélectionnée ────────────────────────────────────────────
+# Rendu de la page sélectionnée
 try:
     PAGES[selection].render()
 except Exception as exc:

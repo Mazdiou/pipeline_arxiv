@@ -25,7 +25,7 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 # ── Constantes ───────────────────────────────────────────────────────────────
-DAG_BOOTSTRAP   = "arxiv_bootstrap"
+DAG_BOOTSTRAP = "arxiv_bootstrap"
 DAG_DAILY_WATCH = "arxiv_daily_watch"
 
 _API_VERSION = "v1"
@@ -34,6 +34,7 @@ _API_VERSION = "v1"
 # =========================================================================== #
 # Helpers                                                                      #
 # =========================================================================== #
+
 
 def _airflow_base_url() -> str:
     """Retourne l'URL de base de l'API Airflow sans slash final."""
@@ -64,7 +65,7 @@ def _post_dag_run(dag_id: str, conf: dict) -> tuple[bool, str]:
     except ImportError:
         return False, "La bibliothèque 'requests' est manquante (pip install requests)."
 
-    url  = f"{_airflow_base_url()}/api/{_API_VERSION}/dags/{dag_id}/dagRuns"
+    url = f"{_airflow_base_url()}/api/{_API_VERSION}/dags/{dag_id}/dagRuns"
     auth = _airflow_auth()
 
     try:
@@ -98,7 +99,10 @@ def _post_dag_run(dag_id: str, conf: dict) -> tuple[bool, str]:
         return True, msg
 
     if response.status_code == 401:
-        return False, "Authentification Airflow échouée. Vérifiez AIRFLOW_USERNAME et AIRFLOW_PASSWORD."
+        return (
+            False,
+            "Authentification Airflow échouée. Vérifiez AIRFLOW_USERNAME et AIRFLOW_PASSWORD.",
+        )
 
     if response.status_code == 404:
         return False, f"DAG '{dag_id}' introuvable dans Airflow. Le DAG est-il activé ?"
@@ -117,6 +121,7 @@ def _post_dag_run(dag_id: str, conf: dict) -> tuple[bool, str]:
 # =========================================================================== #
 # API publique                                                                 #
 # =========================================================================== #
+
 
 def trigger_bootstrap(category_id: str) -> tuple[bool, str]:
     """
@@ -148,7 +153,7 @@ def trigger_reenrich(category_id: str) -> tuple[bool, str]:
     return _post_dag_run(
         dag_id=DAG_BOOTSTRAP,
         conf={
-            "category_id":  category_id,
+            "category_id": category_id,
             "skip_collect": True,
             "skip_process": True,
         },
@@ -165,6 +170,42 @@ def trigger_daily_watch() -> tuple[bool, str]:
     return _post_dag_run(dag_id=DAG_DAILY_WATCH, conf={})
 
 
+def get_running_bootstraps() -> set[str]:
+    """
+    Retourne les category_id dont le DAG arxiv_bootstrap est en cours
+    (state = 'running' ou 'queued').
+
+    Utilisé pour désactiver le bouton "Lancer le pipeline" pendant
+    qu'un run est actif sur une catégorie donnée.
+
+    Returns:
+        Ensemble de category_id (ex: {'stat_ML', 'math_AP'}).
+        Ensemble vide si Airflow est indisponible ou aucun run actif.
+    """
+    try:
+        import requests
+
+        url = f"{_airflow_base_url()}/api/{_API_VERSION}/dags/{DAG_BOOTSTRAP}/dagRuns"
+        auth = _airflow_auth()
+        active: set[str] = set()
+        for state in ("running", "queued"):
+            resp = requests.get(
+                url,
+                auth=auth,
+                params={"state": state, "limit": 50},
+                timeout=5,
+            )
+            if resp.status_code != 200:
+                continue
+            for run in resp.json().get("dag_runs", []):
+                cat = (run.get("conf") or {}).get("category_id")
+                if cat:
+                    active.add(cat)
+        return active
+    except Exception:
+        return set()
+
+
 def is_airflow_available() -> bool:
     """
     Vérifie rapidement que l'API Airflow est joignable.
@@ -174,7 +215,8 @@ def is_airflow_available() -> bool:
     """
     try:
         import requests
-        url  = f"{_airflow_base_url()}/api/{_API_VERSION}/health"
+
+        url = f"{_airflow_base_url()}/api/{_API_VERSION}/health"
         auth = _airflow_auth()
         resp = requests.get(url, auth=auth, timeout=3)
         return resp.status_code == 200
@@ -194,6 +236,7 @@ def get_recent_runs(limit: int = 20) -> list[dict]:
     """
     try:
         import requests
+
         auth = _airflow_auth()
         base = _airflow_base_url()
         results: list[dict] = []
@@ -212,14 +255,16 @@ def get_recent_runs(limit: int = 20) -> list[dict]:
             for r in resp.json().get("dag_runs", []):
                 conf = r.get("conf") or {}
                 category = conf.get("category_id", "—")
-                results.append({
-                    "dag_id":     dag_id,
-                    "category":   category,
-                    "state":      r.get("state", "unknown"),
-                    "start_date": r.get("start_date"),
-                    "end_date":   r.get("end_date"),
-                    "run_id":     r.get("dag_run_id", ""),
-                })
+                results.append(
+                    {
+                        "dag_id": dag_id,
+                        "category": category,
+                        "state": r.get("state", "unknown"),
+                        "start_date": r.get("start_date"),
+                        "end_date": r.get("end_date"),
+                        "run_id": r.get("dag_run_id", ""),
+                    }
+                )
 
         results.sort(key=lambda r: r["start_date"] or "", reverse=True)
         return results[:limit]
@@ -242,7 +287,8 @@ def get_dag_status(dag_id: str, limit: int = 5) -> list[dict]:
     """
     try:
         import requests
-        url  = f"{_airflow_base_url()}/api/{_API_VERSION}/dags/{dag_id}/dagRuns"
+
+        url = f"{_airflow_base_url()}/api/{_API_VERSION}/dags/{dag_id}/dagRuns"
         auth = _airflow_auth()
         resp = requests.get(
             url,
@@ -256,9 +302,9 @@ def get_dag_status(dag_id: str, limit: int = 5) -> list[dict]:
         return [
             {
                 "dag_run_id": r.get("dag_run_id"),
-                "state":      r.get("state"),
+                "state": r.get("state"),
                 "start_date": r.get("start_date"),
-                "end_date":   r.get("end_date"),
+                "end_date": r.get("end_date"),
             }
             for r in runs
         ]

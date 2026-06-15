@@ -52,16 +52,17 @@ class CategoryConfig:
     """
 
     display_name: str
+    arxiv_category: str  # Vraie catégorie arXiv (ex: "stat.ML", "cs.AI", "quant-ph")
     query: str = ""
     # Fenêtre temporelle
-    lookback_days: int = 180           # jours en arrière (ignoré si start_date fourni)
-    start_date: Optional[str] = None   # "YYYY-MM-DD" — prioritaire sur lookback_days
-    end_date: Optional[str] = None     # "YYYY-MM-DD" — défaut aujourd'hui si None
+    lookback_days: int = 180  # jours en arrière (ignoré si start_date fourni)
+    start_date: Optional[str] = None  # "YYYY-MM-DD" — prioritaire sur lookback_days
+    end_date: Optional[str] = None  # "YYYY-MM-DD" — défaut aujourd'hui si None
     # Collecte
     max_results: int = 6000
     fetch_citations: bool = True
-    sort_by: str = "submittedDate"     # submittedDate | relevance | lastUpdatedDate
-    sort_order: str = "descending"     # descending | ascending
+    sort_by: str = "submittedDate"  # submittedDate | relevance | lastUpdatedDate
+    sort_order: str = "descending"  # descending | ascending
     # NLP — topics
     nr_topics: Optional[int] = None
     # NLP — tendances
@@ -79,6 +80,8 @@ class CategoryConfig:
     def _validate(self) -> None:
         if not self.display_name or not self.display_name.strip():
             raise ValueError("display_name ne peut pas être vide.")
+        if not self.arxiv_category or not self.arxiv_category.strip():
+            raise ValueError("arxiv_category ne peut pas être vide.")
         if self.lookback_days <= 0:
             raise ValueError("lookback_days doit être > 0.")
         if self.start_date is not None:
@@ -129,8 +132,13 @@ class CategoryConfig:
 
     @classmethod
     def from_dict(cls, data: dict) -> "CategoryConfig":
+        # Récupérer arxiv_category depuis data
+        # (doit être rempli par load_all si manquant dans les anciennes configs)
+        arxiv_category = data.get("arxiv_category", "")
+
         return cls(
             display_name=data.get("display_name", ""),
+            arxiv_category=arxiv_category,
             query=data.get("query", ""),
             lookback_days=int(data.get("lookback_days", 180)),
             start_date=data.get("start_date"),
@@ -177,6 +185,9 @@ class ConfigStore:
             result: dict[str, CategoryConfig] = {}
             for cat_id, data in raw.items():
                 try:
+                    # Si arxiv_category manque, le dénormaliser
+                    if "arxiv_category" not in data or not data.get("arxiv_category"):
+                        data["arxiv_category"] = _denormalize_category_id(cat_id)
                     result[cat_id] = CategoryConfig.from_dict(data)
                 except (ValueError, TypeError) as exc:
                     logger.warning(
@@ -184,9 +195,7 @@ class ConfigStore:
                     )
             return result
         except json.JSONDecodeError as exc:
-            logger.error(
-                "pipeline_configs.json illisible (JSON invalide) : %s", exc
-            )
+            logger.error("pipeline_configs.json illisible (JSON invalide) : %s", exc)
             return {}
 
     def get(self, category_id: str) -> Optional[CategoryConfig]:
@@ -256,30 +265,46 @@ def normalize_category_id(arxiv_id: str) -> str:
     Returns:
         Clé interne (ex: 'stat_ML').
     """
-    return arxiv_id.strip().replace(".", "_")
+    return (
+        arxiv_id.strip().lower().replace(".", "_").replace("/", "_").replace("-", "_")
+    )
 
 
 def validate_arxiv_id(arxiv_id: str) -> Optional[str]:
-    """
-    Valide le format d'un identifiant arXiv.
-
-    Formats acceptés : 'primary.Sub', 'primary_Sub', 'primary.sub.Sub'.
-
-    Args:
-        arxiv_id : Identifiant brut saisi par l'utilisateur.
-
-    Returns:
-        Message d'erreur (str) si invalide, None si valide.
-    """
-    clean = arxiv_id.strip()
-    if not clean:
+    if not arxiv_id or not arxiv_id.strip():
         return "L'identifiant arXiv ne peut pas être vide."
-    normalized = normalize_category_id(clean)
-    if "_" not in normalized:
-        return (
-            "Format invalide. Exemple attendu : 'stat.ML', 'cs.AI', 'math.AP'."
-        )
-    parts = normalized.split("_", 1)
-    if not all(p.replace("-", "").isalnum() for p in parts):
-        return "L'identifiant ne doit contenir que des lettres, chiffres, tirets et points."
+
+    clean = arxiv_id.strip()
+
+    # validation basique du format arXiv original
+    if not all(c.isalnum() or c in "-./" for c in clean):
+        return "Identifiant arXiv invalide."
+
     return None
+
+
+def _denormalize_category_id(category_id: str) -> str:
+    """
+    Tente de récupérer la vraie catégorie arXiv à partir de category_id normalisé.
+
+    Utilise comme fallback si arxiv_category manque dans les anciennes configs.
+
+    Exemples :
+        'stat_ML'  → 'stat.ML'
+        'cs_LG'    → 'cs.LG'
+        'q_bio_BM' → 'q-bio.BM' (heuristique)
+    """
+    # Cas spécial pour les catégories avec tirets (q-bio, econ, etc)
+    if "q_bio" in category_id:
+        return category_id.replace("q_bio_", "q-bio.").replace("_", "-")
+    if "econ_" in category_id:
+        return category_id.replace("econ_", "econ.").replace("_", "-")
+
+    # Cas général : remplacer le dernier _ avant une majuscule par un point
+    # Exemple: "stat_ML" → "stat.ML"
+    parts = category_id.split("_")
+    if len(parts) == 2:
+        return f"{parts[0]}.{parts[1]}"
+
+    # Fallback : simplement remplacer les underscores par des points
+    return category_id.replace("_", ".")

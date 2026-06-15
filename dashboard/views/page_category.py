@@ -1,29 +1,14 @@
-"""
-dashboard/views/page_category.py
-
-Page 1 — Vue catégorie.
-
-Affiche une vue d'ensemble d'une catégorie arXiv :
-    - Sélecteur de catégorie (partagé avec les autres pages via session_state)
-    - KPI bar : articles, topics, mois, nouveauté moyenne, % anglais
-    - Volume mensuel : bar chart d'articles par mois
-    - Top topics : bar chart horizontal coloré par état
-    - États des topics : badges EMERGING / TRENDING / STABLE / …
-
-Architecture interne :
-    render()
-    _render_kpis()
-    _render_volume_chart()
-    _render_topics_chart()
-    _render_status_badges()
-"""
-
 from __future__ import annotations
 
 import plotly.graph_objects as go
 import streamlit as st
 
-from dashboard.core.constants import STATUS_COLORS, STATUS_LABELS
+from dashboard.core.constants import (
+    STATUS_COLORS,
+    STATUS_DESCRIPTIONS,
+    STATUS_LABELS,
+    fmt_number,
+)
 from dashboard.core.db import (
     get_categories_with_data,
     get_category_overview,
@@ -34,12 +19,7 @@ from dashboard.core.db import (
 from dashboard.core.ui_helpers import render_category_selector, truncate_label
 
 
-# =========================================================================== #
-# Point d'entrée public                                                        #
-# =========================================================================== #
-
 def render() -> None:
-    """Point d'entrée de la Page 1 — appelé par app.py."""
     st.title("Vue catégorie")
 
     categories = get_categories_with_data()
@@ -74,50 +54,50 @@ def render() -> None:
     _render_status_badges(category_id)
 
 
-# =========================================================================== #
-# KPI bar                                                                      #
-# =========================================================================== #
-
 def _render_kpis(overview: dict) -> None:
-    """Affiche les 5 métriques clés de la catégorie."""
     c1, c2, c3, c4, c5 = st.columns(5)
 
     c1.metric(
         "Articles",
-        f"{overview['n_articles']:,}".replace(",", " "),
+        fmt_number(overview["n_articles"]),
     )
     c2.metric(
         "Topics",
         overview["n_topics"],
+        help="Nombre de topics BERTopic détectés sur l'ensemble des données de cette catégorie.",
     )
+    months_help = None
+    if overview.get("date_min") and overview.get("date_max"):
+        months_help = (
+            f"Plage : {overview['date_min']} → {overview['date_max']}. "
+            "Attention : peut contenir des mois sans données si la collecte était inactive."
+        )
     c3.metric(
-        "Mois couverts",
+        "Mois avec données",
         overview["n_months"],
-        help=(
-            f"De {overview['date_min']} à {overview['date_max']}"
-            if overview.get("date_min")
-            else None
-        ),
+        help=months_help,
     )
     nov = overview.get("avg_novelty")
     c4.metric(
         "Nouveauté moy.",
         f"{nov:.3f}" if nov is not None else "—",
-        help="Score de nouveauté moyen des articles (0 = très similaire aux existants, 1 = très nouveau).",
+        help=(
+            "Score d'isolement sémantique moyen des articles (0 → 1). "
+            "0 = très similaire aux articles existants du topic, "
+            "1 = très différent (potentiellement nouveau angle de recherche). "
+            "Calculé à partir des embeddings par le module Enricher. "
+            "Voir la page **Analyse topic** pour la formule détaillée."
+        ),
     )
     pct = overview.get("pct_english")
     c5.metric(
-        "Anglais",
+        "% anglais",
         f"{pct:.0f} %" if pct is not None else "—",
+        help="Pourcentage d'articles dont la langue détectée est l'anglais.",
     )
 
 
-# =========================================================================== #
-# Volume mensuel                                                               #
-# =========================================================================== #
-
 def _render_volume_chart(category: str) -> None:
-    """Bar chart du nombre d'articles publiés par mois."""
     st.subheader("Volume mensuel")
 
     data = get_monthly_volumes(category)
@@ -125,7 +105,7 @@ def _render_volume_chart(category: str) -> None:
         st.caption("Pas de données de volume disponibles.")
         return
 
-    months     = [d["month"] for d in data]
+    months = [d["month"] for d in data]
     n_articles = [d["n_articles"] for d in data]
 
     fig = go.Figure(
@@ -149,12 +129,7 @@ def _render_volume_chart(category: str) -> None:
     st.plotly_chart(fig, use_container_width=True)
 
 
-# =========================================================================== #
-# Top topics                                                                   #
-# =========================================================================== #
-
 def _render_topics_chart(category: str) -> None:
-    """Bar chart horizontal des topics les plus actifs."""
     st.subheader("Top topics")
 
     topics = get_top_topics(category, limit=20)
@@ -162,20 +137,25 @@ def _render_topics_chart(category: str) -> None:
         st.caption("Aucun topic disponible.")
         return
 
-    # Tronque les labels trop longs pour l'axe Y
-    labels  = [truncate_label(t["topic_label"]) for t in topics]
-    values  = [t["n_articles"] for t in topics]
-    colors  = [
-        STATUS_COLORS.get(t["last_status"] or "", "#6B7280")
-        for t in topics
-    ]
-    hovers  = [
-        f"<b>{t['topic_label']}</b><br>"
-        f"{t['n_articles']:,} articles · {t['n_months_active']} mois actif"
-        f"{'<br>État : ' + STATUS_LABELS.get(t['last_status'], t['last_status']) if t['last_status'] else ''}"
-        "<extra></extra>"
-        for t in topics
-    ]
+    labels = [truncate_label(t["topic_label"]) for t in topics]
+    values = [t["n_articles"] for t in topics]
+    colors = [STATUS_COLORS.get(t["last_status"] or "", "#6B7280") for t in topics]
+    hovers = []
+    for t in topics:
+        n_art = f"{t['n_articles']:,}".replace(",", "\u202f")
+        status_line = ""
+        if t.get("last_status"):
+            status_label = STATUS_LABELS.get(t["last_status"], t["last_status"])
+            status_desc = STATUS_DESCRIPTIONS.get(t["last_status"], "")
+            status_line = f"<br>État : {status_label}"
+            if status_desc:
+                status_line += f"<br><i>{status_desc}</i>"
+        hovers.append(
+            f"<b>{t['topic_label']}</b><br>"
+            f"{n_art} articles · {t['n_months_active']} mois actif"
+            f"{status_line}"
+            "<extra></extra>"
+        )
 
     fig = go.Figure(
         go.Bar(
@@ -197,7 +177,6 @@ def _render_topics_chart(category: str) -> None:
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    # Légende — seulement les états présents dans les données
     present = {t["last_status"] for t in topics if t["last_status"]}
     if present:
         st.caption(
@@ -210,15 +189,7 @@ def _render_topics_chart(category: str) -> None:
         )
 
 
-# =========================================================================== #
-# États des topics                                                             #
-# =========================================================================== #
-
 def _render_status_badges(category: str) -> None:
-    """
-    Affiche les compteurs de topics par état sous forme de badges en colonnes.
-    Seuls les états présents dans les données sont affichés.
-    """
     st.subheader("États des topics")
 
     counts = get_status_counts(category)
@@ -226,8 +197,7 @@ def _render_status_badges(category: str) -> None:
         st.caption("Aucun rapport de tendances disponible.")
         return
 
-    # Construire la liste des états présents dans l'ordre voulu
-    order   = ["EMERGING", "TRENDING", "TRANSFORMING", "STABLE", "DECLINING", "NEW"]
+    order = ["EMERGING", "TRENDING", "TRANSFORMING", "STABLE", "DECLINING", "NEW"]
     present = [(s, counts[s]) for s in order if counts.get(s, 0) > 0]
 
     if not present:
@@ -238,13 +208,16 @@ def _render_status_badges(category: str) -> None:
     for col, (status, n) in zip(cols, present):
         color = STATUS_COLORS.get(status, "#6B7280")
         label = STATUS_LABELS.get(status, status)
+        desc = STATUS_DESCRIPTIONS.get(status, "")
+        topic_str = "topic" if n == 1 else "topics"
         col.markdown(
             f"<div style='background:{color}18; border:1px solid {color}40; "
-            f"border-radius:10px; padding:10px 14px; text-align:center;'>"
+            f"border-radius:10px; padding:10px 14px; text-align:center;' "
+            f"title='{desc}'>"
             f"<div style='color:{color}; font-weight:700; font-size:0.85em; "
             f"text-transform:uppercase; letter-spacing:0.05em;'>{label}</div>"
             f"<div style='font-size:1.6em; font-weight:700; margin-top:4px;'>{n}</div>"
-            f"<div style='font-size:0.75em; color:#888;'>topic{'s' if n > 1 else ''}</div>"
+            f"<div style='font-size:0.75em; color:#888;'>{topic_str}</div>"
             f"</div>",
             unsafe_allow_html=True,
         )

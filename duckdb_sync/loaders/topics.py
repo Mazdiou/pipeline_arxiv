@@ -126,10 +126,7 @@ def _load_dim_topics(
     dim_df = pd.DataFrame(rows)
     conn.register("_dim_topics_batch", dim_df)
 
-    # ON CONFLICT : ne mettre à jour le label que si le nouveau est descriptif
-    # OU si l'existant est déjà générique. Ainsi un bon label n'est jamais perdu.
-    conn.execute(
-        """
+    conn.execute("""
         INSERT INTO dim_topics
             (topic_id, category, topic_label, first_month, last_month, n_months_active)
         SELECT topic_id, category, topic_label, first_month, last_month, n_months_active
@@ -143,8 +140,7 @@ def _load_dim_topics(
             END,
             last_month      = excluded.last_month,
             n_months_active = excluded.n_months_active
-    """
-    )
+    """)
     conn.unregister("_dim_topics_batch")
 
 

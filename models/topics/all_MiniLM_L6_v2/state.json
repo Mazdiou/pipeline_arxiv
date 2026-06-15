@@ -1,0 +1,32 @@
+{
+  "stat_ML": {
+    "max_topic_id": 24,
+    "n_partitions": 22,
+    "last_outlier_rate": 0.0,
+    "fitted_at": "2026-05-19T11:27:58.916176+00:00"
+  },
+  "cs_LG": {
+    "max_topic_id": 41,
+    "n_partitions": 23,
+    "last_outlier_rate": 0.0076,
+    "fitted_at": "2026-06-10T18:56:35.800899+00:00"
+  },
+  "cs_CR": {
+    "max_topic_id": 37,
+    "n_partitions": 30,
+    "last_outlier_rate": 0.0,
+    "fitted_at": "2026-06-10T20:31:46.541929+00:00"
+  },
+  "cs_DB": {
+    "max_topic_id": 33,
+    "n_partitions": 30,
+    "last_outlier_rate": 0.0,
+    "fitted_at": "2026-06-12T12:38:52.225585+00:00"
+  },
+  "cs_ai": {
+    "max_topic_id": 83,
+    "n_partitions": 29,
+    "last_outlier_rate": 0.0012,
+    "fitted_at": "2026-06-15T17:02:15.478705+00:00"
+  }
+}

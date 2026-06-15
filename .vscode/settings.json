@@ -1,0 +1,27 @@
+{
+  "workbench.editorAssociations": {
+    "*.copilotmd": "vscode.markdown.preview.editor",
+    "*.parquet": "duckdb.dataFileViewer",
+    "*.csv": "duckdb.dataFileViewer",
+    "*.tsv": "duckdb.dataFileViewer",
+    "*.xlsx": "duckdb.dataFileViewer"
+  },
+  "duckdb.databases": [
+    {
+      "alias": "dashboard",
+      "type": "file",
+      "path": "c:\\Users\\TRETEC\\Desktop\\arxiv_pipeline\\data\\dashboard.duckdb",
+      "readOnly": true,
+      "attached": true
+    }
+  ],
+  "duckdb.defaultDatabase": "memory",
+  "sqltools.connections": [
+    {
+      "previewLimit": 50,
+      "driver": "DuckDB",
+      "name": "fzf",
+      "database": "${workspaceFolder:arxiv_pipeline}/data/dashboard.duckdb"
+    }
+  ]
+}
